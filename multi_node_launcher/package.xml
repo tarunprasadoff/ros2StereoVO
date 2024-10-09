@@ -8,7 +8,7 @@
   <license>TODO: License declaration</license>
 
   <depend>image_loader</depend>
-  <depend>visual_odometry_node</depend>
+  <depend>visual_odometry</depend>
   <depend>point_cloud_stitcher</depend>
   <depend>rclcpp</depend>
   <depend>launch</depend>

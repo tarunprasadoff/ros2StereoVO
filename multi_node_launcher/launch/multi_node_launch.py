@@ -10,7 +10,7 @@ def generate_launch_description():
             output='screen'
         ),
         Node(
-            package='visual_odometry_node',
+            package='visual_odometry',
             executable='visual_odometry_node',
             name='visual_odometry',
             output='screen'

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(visual_odometry_node)
+project(visual_odometry)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -9,27 +9,22 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(geometry_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
-find_package(image_transport REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
 
+# Add the executable
 add_executable(visual_odometry_node src/visual_odometry_node.cpp)
 
-ament_target_dependencies(
-  visual_odometry_node
-  rclcpp
-  sensor_msgs
-  geometry_msgs
-  cv_bridge
-  OpenCV
-  image_transport
-  Eigen3
-)
+# Link the required libraries
+ament_target_dependencies(visual_odometry_node rclcpp sensor_msgs cv_bridge geometry_msgs OpenCV)
 
-target_link_libraries(visual_odometry_node ${OpenCV_LIBRARIES} Eigen3::Eigen)
+target_link_libraries(visual_odometry_node Eigen3::Eigen)
 
+# Install the executable
 install(TARGETS
   visual_odometry_node
   DESTINATION lib/${PROJECT_NAME})
