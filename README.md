@@ -5,12 +5,6 @@ Image Loader Node: Loads and publishes stereo camera images.
 Visual Odometry Node: Estimates the robot's pose from the stereo images.
 Point Cloud Stitcher & Octomap Generator: Unprojects depth images into point clouds, stitches them, and generates a 3D map.
 Multi Node Launcher: Launches the three nodes together.
-Repository Overview
-ROS2 Packages
-image_loader: Publishes left and depth images as ROS2 messages.
-visual_odometry_node: Uses stereo visual odometry to estimate the camera pose.
-point_cloud_stitcher: Converts depth images to point clouds and generates an Octomap.
-multi_node_launcher: Launches all three nodes together.
 Prerequisites
 ROS2 Foxy (or any ROS2 distribution)
 OpenCV: For image processing
@@ -66,14 +60,11 @@ Launch the image_loader node to publish the stereo images.
 Start the visual_odometry_node to estimate the camera pose.
 Run the point_cloud_stitcher to convert depth images into point clouds and generate a 3D map.
 Approach
-1. Image Loader Node
-This node reads left and depth camera images from directories, converts them to ROS2 image messages, and publishes them on the appropriate topics. The node uses OpenCV to load the images and cv_bridge to convert them for ROS2. The publish rate is configurable via a parameter.
+Image Loader Node: This node reads left and depth camera images from directories, converts them to ROS2 image messages, and publishes them on the appropriate topics. The node uses OpenCV to load the images and cv_bridge to convert them for ROS2. The publish rate is configurable via a parameter.
 
-2. Visual Odometry Node
-The visual odometry node subscribes to the stereo camera images and depth data, using stereo visual odometry techniques to estimate the robot's pose. The node applies a minimal filtering technique and uses OpenCV’s solvePnPRansac to calculate the pose, publishing it as a PoseStamped message. The accuracy of the pose estimate is impacted due to limited filtering and unoptimized depth processing.
+Visual Odometry Node: The visual odometry node subscribes to the stereo camera images and depth data, using stereo visual odometry techniques to estimate the robot's pose. The node applies a minimal filtering technique and uses OpenCV’s solvePnPRansac to calculate the pose, publishing it as a PoseStamped message. The accuracy of the pose estimate is impacted due to limited filtering and unoptimized depth processing.
 
-3. Point Cloud Stitcher & Octomap Generator Node
-This node subscribes to the depth images and estimated poses, converting depth data into point clouds. These point clouds are stitched together using the pose estimates, and an Octomap is generated. The map is visualized using Pangolin. Due to reliance on the odometry node, the map accuracy depends on the pose estimates.
+Point Cloud Stitcher & Octomap Generator Node: This node subscribes to the depth images and estimated poses, converting depth data into point clouds. These point clouds are stitched together using the pose estimates, and an Octomap is generated. The map is visualized using Pangolin. Due to reliance on the odometry node, the map accuracy depends on the pose estimates.
 
 Assumptions and Challenges
 Assumptions:
