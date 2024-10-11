@@ -1,274 +1,215 @@
-#include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/image.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
-#include <cv_bridge/cv_bridge.h>
-#include <opencv2/opencv.hpp>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
-#include <pcl/common/transforms.h>
-#include <Eigen/Dense>
-#include <octomap/octomap.h>
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/image.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "opencv2/opencv.hpp"
+#include "cv_bridge/cv_bridge.h"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "octomap/octomap.h"
+#include "octomap/OcTree.h"
+#include "octomap_msgs/msg/octomap.hpp"
+#include "octomap_msgs/conversions.h"
 #include <pangolin/pangolin.h>
-#include <GL/glut.h>
-#include <mutex>
+#include <vector>
 
-class PointCloudStitcher : public rclcpp::Node
-{
+class PointCloudStitcher : public rclcpp::Node {
 public:
-    PointCloudStitcher() : Node("point_cloud_stitcher"), octree_(0.1)
-    {
-        // Subscribing to depth image and pose topics
+    PointCloudStitcher() : Node("point_cloud_stitcher"), frame_count(0) {
+        // Subscription to depth image
         depth_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-            "/camera/depth/image_raw", 10, std::bind(&PointCloudStitcher::depthCallback, this, std::placeholders::_1));
+            "/camera/depth/image_raw", 10,
+            std::bind(&PointCloudStitcher::depthImageCallback, this, std::placeholders::_1));
 
+        // Subscription to robot pose
         pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-            "/robot/pose", 10, std::bind(&PointCloudStitcher::poseCallback, this, std::placeholders::_1));
+            "/robot/pose", 10,
+            std::bind(&PointCloudStitcher::poseCallback, this, std::placeholders::_1));
 
-        timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(1000),
-            std::bind(&PointCloudStitcher::stitchAndGenerateMap, this));
+        // Create an Octomap with a resolution of 0.1 meters
+        octree_ = std::make_shared<octomap::OcTree>(0.1);  // 0.1 meter resolution
 
-        RCLCPP_INFO(this->get_logger(), "PointCloudStitcher node has been started.");
+        // Initialize Pangolin for visualization
+        initPangolin();
     }
 
 private:
-    std::mutex data_mutex_;  // Mutex to prevent concurrent access to shared data
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
+    geometry_msgs::msg::PoseStamped current_pose_;
+    std::vector<geometry_msgs::msg::Point> accumulated_point_cloud;
+    int frame_count;
+    const int N = 10;  // Number of frames to accumulate
+    std::shared_ptr<octomap::OcTree> octree_;  // Octree for Octomap
+    pangolin::OpenGlRenderState s_cam_;
+    pangolin::View* d_cam_;
 
-    // Callback for depth image data
-    void depthCallback(const sensor_msgs::msg::Image::SharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        if (msg->data.empty())
-        {
-            RCLCPP_ERROR(this->get_logger(), "Received empty depth image.");
+    // Camera intrinsics
+    const double fx = 348.925, fy = 351.135;
+    const double cx = 339.075, cy = 177.45;
+
+    // Callback for receiving depth images
+    void depthImageCallback(const sensor_msgs::msg::Image::SharedPtr msg) {
+        // Convert depth image to OpenCV format
+        cv_bridge::CvImagePtr cv_ptr;
+        try {
+            cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_32FC1);
+        } catch (cv_bridge::Exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
             return;
         }
 
-        RCLCPP_INFO(this->get_logger(), "Received depth image of size: %zu", msg->data.size());
-
-        // Log depth image info for first few points
-        cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_16UC1);
-        cv::Mat depth_image = cv_ptr->image;
-        uint16_t depth_sample = depth_image.at<uint16_t>(0, 0);  // First depth value
-        RCLCPP_INFO(this->get_logger(), "First depth value: %u", depth_sample);
-
-        auto cloud = depthToPointCloud(msg);
-        accumulated_clouds_.push_back(cloud);
-    }
-
-    void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        current_pose_ = msg;
-
-        // Log current pose
-        RCLCPP_INFO(this->get_logger(), "Received pose: x = %f, y = %f, z = %f, qw = %f, qx = %f, qy = %f, qz = %f",
-                    msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
-                    msg->pose.orientation.w, msg->pose.orientation.x, msg->pose.orientation.y, msg->pose.orientation.z);
-    }
-
-    // Convert depth image to point cloud
-    pcl::PointCloud<pcl::PointXYZ>::Ptr depthToPointCloud(const sensor_msgs::msg::Image::SharedPtr depth_msg)
-    {
-        cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(depth_msg, sensor_msgs::image_encodings::TYPE_16UC1);
-        cv::Mat depth_image = cv_ptr->image;
-
-        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
-
-        // Camera intrinsics
-        float fx = 348.925;
-        float fy = 351.135;
-        float cx = 339.075;
-        float cy = 177.45;
-        float depth_scale = 0.001;  // Adjust based on your depth image scale
-
-        for (int v = 0; v < depth_image.rows; ++v)
-        {
-            for (int u = 0; u < depth_image.cols; ++u)
-            {
-                uint16_t depth = depth_image.at<uint16_t>(v, u);
-                if (depth == 0) continue;  // Skip invalid depth points
-
-                float z = depth * depth_scale;
-
-                // Sanity check to avoid division by zero
-                if (fx == 0.0 || fy == 0.0)
-                {
-                    RCLCPP_ERROR(this->get_logger(), "Invalid camera intrinsic values. fx or fy is zero.");
-                    continue;
-                }
-
-                float x = (u - cx) * z / fx;
-                float y = (v - cy) * z / fy;
-
-                // Additional sanity check for NaN or infinity values
-                if (std::isnan(x) || std::isnan(y) || std::isnan(z) || 
-                    std::isinf(x) || std::isinf(y) || std::isinf(z))
-                {
-                    RCLCPP_ERROR(this->get_logger(), "Invalid point detected: x = %f, y = %f, z = %f", x, y, z);
-                    continue;
-                }
-
-                cloud->points.emplace_back(x, y, z);
-            }
-        }
-
-        RCLCPP_INFO(this->get_logger(), "Converted depth image to point cloud with %zu points.", cloud->points.size());
-
-        return cloud;
-    }
-
-    // Transform point cloud using robot pose
-    pcl::PointCloud<pcl::PointXYZ>::Ptr transformPointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, const geometry_msgs::msg::PoseStamped::SharedPtr pose_msg)
-    {
-        Eigen::Affine3d transform = Eigen::Affine3d::Identity();
-        transform.translation() << pose_msg->pose.position.x, pose_msg->pose.position.y, pose_msg->pose.position.z;
-        Eigen::Quaterniond q(pose_msg->pose.orientation.w, pose_msg->pose.orientation.x, pose_msg->pose.orientation.y, pose_msg->pose.orientation.z);
+        // Unproject the depth image to a point cloud
+        std::vector<geometry_msgs::msg::Point> local_cloud = unprojectDepthImage(cv_ptr->image);
         
-        // Sanity check for valid quaternion
-        if (q.norm() == 0.0)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Invalid quaternion in pose data.");
-            return cloud;  // Return the original cloud if quaternion is invalid
-        }
+        // Transform the point cloud to the world frame using the current pose
+        std::vector<geometry_msgs::msg::Point> world_cloud = transformToWorldFrame(local_cloud, current_pose_);
+        
+        // Accumulate the point cloud
+        accumulated_point_cloud.insert(accumulated_point_cloud.end(), world_cloud.begin(), world_cloud.end());
+        frame_count++;
 
-        transform.rotate(q);
-
-        pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-        pcl::transformPointCloud(*cloud, *transformed_cloud, transform.matrix());
-
-        RCLCPP_INFO(this->get_logger(), "Transformed point cloud with pose data.");
-
-        return transformed_cloud;
-    }
-
-    // Stitch point clouds and generate an Octomap
-    void stitchAndGenerateMap()
-    {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        try
-        {
-            if (current_pose_ == nullptr || accumulated_clouds_.empty())
-            {
-                RCLCPP_WARN(this->get_logger(), "No pose or depth clouds available, skipping stitching.");
-                return;
-            }
-
-            // Check if the pose is effectively "empty" (no movement)
-            if (current_pose_->pose.position.x == 0.0 && current_pose_->pose.position.y == 0.0 && current_pose_->pose.position.z == 0.0 &&
-                current_pose_->pose.orientation.w == 1.0 && current_pose_->pose.orientation.x == 0.0 && current_pose_->pose.orientation.y == 0.0 &&
-                current_pose_->pose.orientation.z == 0.0)
-            {
-                RCLCPP_WARN(this->get_logger(), "Received pose is identity (no movement), skipping map update.");
-                return; // Skip updating the map if there is no movement
-            }
-
-            RCLCPP_INFO(this->get_logger(), "Stitching and generating Octomap.");
-
-            for (auto& cloud : accumulated_clouds_)
-            {
-                auto transformed_cloud = transformPointCloud(cloud, current_pose_);
-
-                // Skip if the transformed cloud is empty
-                if (transformed_cloud->points.empty())
-                {
-                    RCLCPP_WARN(this->get_logger(), "Transformed point cloud is empty, skipping this cloud.");
-                    continue;
-                }
-
-                for (const auto& point : transformed_cloud->points)
-                {
-                    // Sanity check for invalid points
-                    if (std::isnan(point.x) || std::isnan(point.y) || std::isnan(point.z) ||
-                        std::isinf(point.x) || std::isinf(point.y) || std::isinf(point.z))
-                    {
-                        RCLCPP_ERROR(this->get_logger(), "Invalid point detected after transformation: x = %f, y = %f, z = %f", point.x, point.y, point.z);
-                        continue;  // Skip invalid points
-                    }
-
-                    // Ensure the point is within a reasonable range (to avoid out-of-bounds errors)
-                    if (std::abs(point.x) > 1000 || std::abs(point.y) > 1000 || std::abs(point.z) > 1000)
-                    {
-                        RCLCPP_WARN(this->get_logger(), "Point is out of bounds: x = %f, y = %f, z = %f", point.x, point.y, point.z);
-                        continue;
-                    }
-
-                    // Insert valid points into octree
-                    RCLCPP_INFO(this->get_logger(), "Inserting point into Octomap: x = %f, y = %f, z = %f", point.x, point.y, point.z);
-                    octree_.updateNode(octomap::point3d(point.x, point.y, point.z), true);
-                }
-            }
-
-            octree_.updateInnerOccupancy();
-            octree_.writeBinary("map.bt");
-
-            RCLCPP_INFO(this->get_logger(), "Octomap generated and saved to map.bt.");
-
-            accumulated_clouds_.clear();  // Clear buffer after stitching
-        }
-        catch (const std::exception& e)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Exception caught during map stitching: %s", e.what());
-        }
-        catch (...)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Unknown exception caught during map stitching.");
+        // If we have accumulated N frames, process the point cloud
+        if (frame_count >= N) {
+            // Process the accumulated point cloud (stitching and generating Octomap)
+            stitchAndGenerateOctomap();
+            
+            // Clear the accumulated point cloud and reset the frame counter
+            accumulated_point_cloud.clear();
+            frame_count = 0;
         }
     }
 
-    // Display Octomap using Pangolin
-    void displayOctomap(octomap::OcTree& octree)
-    {
+    // Callback for receiving pose data
+    void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+        current_pose_ = *msg;  // Store the current pose for transformations
+    }
+
+    // Function to unproject a depth image into a 3D point cloud
+    std::vector<geometry_msgs::msg::Point> unprojectDepthImage(const cv::Mat& depth_image) {
+        std::vector<geometry_msgs::msg::Point> point_cloud;
+
+        for (int v = 0; v < depth_image.rows; ++v) {
+            for (int u = 0; u < depth_image.cols; ++u) {
+                float Z = depth_image.at<float>(v, u);
+                if (Z > 0) {  // Only consider points with a valid depth
+                    geometry_msgs::msg::Point point;
+                    point.z = Z;
+                    point.x = (u - cx) * Z / fx;
+                    point.y = (v - cy) * Z / fy;
+                    point_cloud.push_back(point);
+                }
+            }
+        }
+
+        return point_cloud;
+    }
+
+    // Function to transform the point cloud to the world frame using the pose
+    std::vector<geometry_msgs::msg::Point> transformToWorldFrame(
+        const std::vector<geometry_msgs::msg::Point>& local_cloud,
+        const geometry_msgs::msg::PoseStamped& pose) {
+
+        std::vector<geometry_msgs::msg::Point> world_cloud;
+
+        // Create transformation matrix from pose (rotation and translation)
+        tf2::Quaternion q(pose.pose.orientation.x, pose.pose.orientation.y,
+                          pose.pose.orientation.z, pose.pose.orientation.w);
+        tf2::Matrix3x3 rotation_matrix(q);
+
+        for (const auto& point : local_cloud) {
+            geometry_msgs::msg::Point world_point;
+            
+            // Apply rotation
+            world_point.x = rotation_matrix[0][0] * point.x + rotation_matrix[0][1] * point.y + rotation_matrix[0][2] * point.z;
+            world_point.y = rotation_matrix[1][0] * point.x + rotation_matrix[1][1] * point.y + rotation_matrix[1][2] * point.z;
+            world_point.z = rotation_matrix[2][0] * point.x + rotation_matrix[2][1] * point.y + rotation_matrix[2][2] * point.z;
+            
+            // Apply translation (robot's position in the world)
+            world_point.x += pose.pose.position.x;
+            world_point.y += pose.pose.position.y;
+            world_point.z += pose.pose.position.z;
+
+            world_cloud.push_back(world_point);
+        }
+
+        return world_cloud;
+    }
+
+    // Initialize Pangolin for visualization
+    void initPangolin() {
+        // Create OpenGL window in single line
         pangolin::CreateWindowAndBind("Octomap Viewer", 640, 480);
+
+        // Enable depth
         glEnable(GL_DEPTH_TEST);
 
-        pangolin::OpenGlRenderState s_cam(
-            pangolin::ProjectionMatrix(640, 480, 420, 420, 320, 240, 0.2, 100),
-            pangolin::ModelViewLookAt(-1, -1, -1, 0, 0, 0, pangolin::AxisY)
+        // Adjust camera projection and modelview matrix
+        s_cam_ = pangolin::OpenGlRenderState(
+           pangolin::ProjectionMatrix(640, 480, 420, 420, 320, 240, 0.1, 1000),  // Adjust near and far planes
+           pangolin::ModelViewLookAt(0, 0, -10, 0, 0, 0, pangolin::AxisY)  // Adjust the look-at position
         );
 
-        pangolin::Handler3D handler(s_cam);
-        pangolin::View& d_cam = pangolin::CreateDisplay()
-                               .SetBounds(0.0, 1.0, 0.0, 1.0, -640.0f/480.0f)
-                               .SetHandler(&handler);
-
-        while (!pangolin::ShouldQuit())
-        {
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            d_cam.Activate(s_cam);
-            glColor3f(1.0, 1.0, 1.0);
-
-            for (auto it = octree.begin(), end = octree.end(); it != end; ++it)
-            {
-                if (octree.isNodeOccupied(*it))
-                {
-                    octomap::point3d point = it.getCoordinate();
-                    double size = it.getSize() / 2.0;
-
-                    glPushMatrix();
-                    glTranslatef(point.x(), point.y(), point.z());
-                    glutWireCube(size);
-                    glPopMatrix();
-                }
-            }
-
-            pangolin::FinishFrame();
-        }
+        // Create Interactive View in window
+        d_cam_ = &pangolin::CreateDisplay()
+           .SetBounds(0.0, 1.0, 0.0, 1.0, -640.0f/480.0f)
+           .SetHandler(new pangolin::Handler3D(s_cam_));
     }
 
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
-    rclcpp::TimerBase::SharedPtr timer_;
+    // Function to render the Octomap in Pangolin
+    void renderOctomap() {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        d_cam_->Activate(s_cam_);
 
-    geometry_msgs::msg::PoseStamped::SharedPtr current_pose_;
-    std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> accumulated_clouds_;
-    octomap::OcTree octree_;
+        for (octomap::OcTree::leaf_iterator it = octree_->begin_leafs(),
+            end = octree_->end_leafs(); it != end; ++it) {
+           
+            if (octree_->isNodeOccupied(*it)) {
+                double voxel_size = it.getSize();
+                octomap::point3d pt = it.getCoordinate();
+                
+                // Debugging: Log inserted voxel information
+                RCLCPP_INFO(this->get_logger(), "Voxel at x: %f, y: %f, z: %f with size: %f", 
+                            pt.x(), pt.y(), pt.z(), voxel_size);
+
+                // Set color and draw the voxel as a cube
+                glColor3f(0.0f, 0.5f, 1.0f);  // Set a color
+
+                glPushMatrix();
+                glTranslatef(pt.x(), pt.y(), pt.z());
+                glScalef(voxel_size, voxel_size, voxel_size);  // Scale the cube to voxel size
+                pangolin::glDrawColouredCube(-0.5f, 0.5f);  // Draw the cube
+                glPopMatrix();
+            }
+        }
+
+        pangolin::FinishFrame();  // Render frame
+    }
+
+    // Function to stitch the point clouds and generate an Octomap
+    void stitchAndGenerateOctomap() {
+        // Insert accumulated points into Octree
+        for (const auto& point : accumulated_point_cloud) {
+            octree_->updateNode(octomap::point3d(point.x, point.y, point.z), true);
+            
+            // Debugging: Log accumulated points
+            RCLCPP_INFO(this->get_logger(), "Accumulated point at x: %f, y: %f, z: %f", 
+                        point.x, point.y, point.z);
+        }
+
+        // After updating the octree, clear the accumulated points
+        accumulated_point_cloud.clear();
+
+        // Render the updated Octomap
+        renderOctomap();
+    }
 };
 
-int main(int argc, char** argv)
-{
+int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
+    
+    // Create and run the ROS2 node
     rclcpp::spin(std::make_shared<PointCloudStitcher>());
+
     rclcpp::shutdown();
     return 0;
 }

@@ -17,7 +17,7 @@ def generate_launch_description():
         ),
         Node(
             package='point_cloud_stitcher',
-            executable='point_cloud_stitcher_node',
+            executable='point_cloud_stitcher',
             name='point_cloud_stitcher',
             output='screen'
         )

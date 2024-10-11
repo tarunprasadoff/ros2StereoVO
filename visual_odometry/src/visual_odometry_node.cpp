@@ -232,7 +232,7 @@ private:
             // Create a point in normalized 3D space
             cv::Point3f unprojected_pt(x, y, 1.0f);
 
-            RCLCPP_INFO(this->get_logger(), "No Seg Fault yet 1");
+            // RCLCPP_INFO(this->get_logger(), "No Seg Fault yet 1");
 
             // Multiply by the corresponding depth value to get the actual 3D point
             // unprojected_pt *= image_depth_float.at<float>(round(kp.y), round(kp.x));
