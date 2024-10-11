@@ -49,33 +49,38 @@ private:
 
     // Callback for receiving depth images
     void depthImageCallback(const sensor_msgs::msg::Image::SharedPtr msg) {
-        // Convert depth image to OpenCV format
+        // Convert depth image to OpenCV format and apply the same scaling
         cv_bridge::CvImagePtr cv_ptr;
         try {
-            cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_32FC1);
+            // Convert to 16-bit mono format, then apply scale factor
+            cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_16UC1);
+            cv::Mat depth_image = cv_ptr->image;
+
+            // Convert to 32-bit float with scale factor (same as in visual_odometry)
+            depth_image.convertTo(depth_image, CV_32FC1, 0.3125 / 1000.0);  // Convert to meters
+
+            // Unproject the depth image to a point cloud
+            std::vector<geometry_msgs::msg::Point> local_cloud = unprojectDepthImage(depth_image);
+
+            // Transform the point cloud to the world frame using the current pose
+            std::vector<geometry_msgs::msg::Point> world_cloud = transformToWorldFrame(local_cloud, current_pose_);
+
+            // Accumulate the point cloud
+            accumulated_point_cloud.insert(accumulated_point_cloud.end(), world_cloud.begin(), world_cloud.end());
+            frame_count++;
+
+            // If we have accumulated N frames, process the point cloud
+            if (frame_count >= N) {
+                // Process the accumulated point cloud (stitching and generating Octomap)
+                stitchAndGenerateOctomap();
+
+                // Clear the accumulated point cloud and reset the frame counter
+                accumulated_point_cloud.clear();
+                frame_count = 0;
+            }
         } catch (cv_bridge::Exception& e) {
             RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
             return;
-        }
-
-        // Unproject the depth image to a point cloud
-        std::vector<geometry_msgs::msg::Point> local_cloud = unprojectDepthImage(cv_ptr->image);
-        
-        // Transform the point cloud to the world frame using the current pose
-        std::vector<geometry_msgs::msg::Point> world_cloud = transformToWorldFrame(local_cloud, current_pose_);
-        
-        // Accumulate the point cloud
-        accumulated_point_cloud.insert(accumulated_point_cloud.end(), world_cloud.begin(), world_cloud.end());
-        frame_count++;
-
-        // If we have accumulated N frames, process the point cloud
-        if (frame_count >= N) {
-            // Process the accumulated point cloud (stitching and generating Octomap)
-            stitchAndGenerateOctomap();
-            
-            // Clear the accumulated point cloud and reset the frame counter
-            accumulated_point_cloud.clear();
-            frame_count = 0;
         }
     }
 
@@ -160,25 +165,33 @@ private:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         d_cam_->Activate(s_cam_);
 
+        // Debug: Only render the first 10 voxels for testing
+        int voxel_count = 0;
         for (octomap::OcTree::leaf_iterator it = octree_->begin_leafs(),
             end = octree_->end_leafs(); it != end; ++it) {
-           
+        
             if (octree_->isNodeOccupied(*it)) {
-                double voxel_size = it.getSize();
-                octomap::point3d pt = it.getCoordinate();
-                
-                // Debugging: Log inserted voxel information
-                RCLCPP_INFO(this->get_logger(), "Voxel at x: %f, y: %f, z: %f with size: %f", 
-                            pt.x(), pt.y(), pt.z(), voxel_size);
+                if (voxel_count < 10) { // Limit to rendering only 10 voxels
+                    double voxel_size = it.getSize();
+                    octomap::point3d pt = it.getCoordinate();
 
-                // Set color and draw the voxel as a cube
-                glColor3f(0.0f, 0.5f, 1.0f);  // Set a color
+                    // Debugging: Log inserted voxel information
+                    RCLCPP_INFO(this->get_logger(), "Voxel at x: %f, y: %f, z: %f with size: %f", 
+                                pt.x(), pt.y(), pt.z(), voxel_size);
 
-                glPushMatrix();
-                glTranslatef(pt.x(), pt.y(), pt.z());
-                glScalef(voxel_size, voxel_size, voxel_size);  // Scale the cube to voxel size
-                pangolin::glDrawColouredCube(-0.5f, 0.5f);  // Draw the cube
-                glPopMatrix();
+                    // Set color and draw the voxel as a cube
+                    glColor3f(0.0f, 0.5f, 1.0f);  // Set a color
+
+                    glPushMatrix();
+                    glTranslatef(pt.x(), pt.y(), pt.z());
+                    glScalef(voxel_size, voxel_size, voxel_size);  // Scale the cube to voxel size
+                    pangolin::glDrawColouredCube(-0.5f, 0.5f);  // Draw the cube
+                    glPopMatrix();
+
+                    voxel_count++;
+                } else {
+                    break; // Stop rendering after 10 voxels
+                }
             }
         }
 
@@ -187,19 +200,22 @@ private:
 
     // Function to stitch the point clouds and generate an Octomap
     void stitchAndGenerateOctomap() {
-        // Insert accumulated points into Octree
+        // Insert accumulated points into Octree, but limit to a small number for testing
+        int point_count = 0; // Counter for limiting the points
         for (const auto& point : accumulated_point_cloud) {
-            octree_->updateNode(octomap::point3d(point.x, point.y, point.z), true);
-            
-            // Debugging: Log accumulated points
-            RCLCPP_INFO(this->get_logger(), "Accumulated point at x: %f, y: %f, z: %f", 
-                        point.x, point.y, point.z);
+            // Only visualize the first few points for testing
+            if (point_count < 10) { // Limiting to 10 points
+                RCLCPP_INFO(this->get_logger(), "Accumulated point at x: %f, y: %f, z: %f", 
+                            point.x, point.y, point.z);
+
+                octree_->updateNode(octomap::point3d(point.x, point.y, point.z), true);
+                point_count++;
+            } else {
+                break; // Stop after adding 10 points
+            }
         }
 
-        // After updating the octree, clear the accumulated points
-        accumulated_point_cloud.clear();
-
-        // Render the updated Octomap
+        // Render the updated Octomap for the small subset of points
         renderOctomap();
     }
 };
